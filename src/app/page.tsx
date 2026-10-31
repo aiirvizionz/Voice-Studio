@@ -41,6 +41,7 @@ export default function Page() {
   const [notice, setNotice] = useState<{text:string; kind:"ok"|"error"|"info"}|null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [liveState, setLiveState] = useState<LiveState>("idle");
+  const [connectionStep, setConnectionStep] = useState("Vista previa conversacional");
   const [liveTranscript, setLiveTranscript] = useState("");
   const [liveSeconds, setLiveSeconds] = useState(0);
   const [audioUrl, setAudioUrl] = useState<string|null>(null);
@@ -51,7 +52,9 @@ export default function Page() {
   const dcRef = useRef<RTCDataChannel|null>(null);
   const inputRef = useRef<MediaStream|null>(null);
   const recorderRef = useRef<MediaRecorder|null>(null);
-  const chunksRef = useRef<BlobPart[]>([]);
+  const remoteStreamRef = useRef<MediaStream|null>(null);
+  const startupTimerRef = useRef<ReturnType<typeof setTimeout>|null>(null);
+  const failedSessionRef = useRef(false);
   const liveStateRef = useRef<LiveState>("idle");
 
   const selectedVoice = useMemo(()=>voices.find(v=>v.id===selectedId),[voices,selectedId]);
@@ -98,74 +101,206 @@ export default function Page() {
   }
 
   function stopLive() {
-    liveStateRef.current="idle";setLiveState("idle");setLiveSeconds(0);
-    const r=recorderRef.current;
-    if (r && r.state!=="inactive") {try {r.stop();} catch { /* noop */ }}
-    recorderRef.current=null;
-    dcRef.current?.close(); dcRef.current=null;
-    pcRef.current?.close(); pcRef.current=null;
-    inputRef.current?.getTracks().forEach(t=>t.stop());inputRef.current=null;
-    if (audioRef.current) audioRef.current.srcObject=null;
+    // Keep the recorded audio until MediaRecorder has emitted its final chunks.
+    liveStateRef.current = "idle";
+    setLiveState("idle");
+    setConnectionStep("Vista previa conversacional");
+    if (startupTimerRef.current) clearTimeout(startupTimerRef.current);
+    startupTimerRef.current = null;
+    const recorder = recorderRef.current;
+    recorderRef.current = null;
+    if (recorder && recorder.state !== "inactive") {
+      try { recorder.stop(); } catch { /* recorder already closed */ }
+    }
+    const dc = dcRef.current;
+    dcRef.current = null;
+    if (dc && dc.readyState !== "closed") dc.close();
+    pcRef.current?.close();
+    pcRef.current = null;
+    inputRef.current?.getTracks().forEach(track => track.stop());
+    inputRef.current = null;
+    remoteStreamRef.current = null;
+    if (audioRef.current) audioRef.current.srcObject = null;
   }
+
+  function failLive(message: string) {
+    if (liveStateRef.current === "idle") return;
+    failedSessionRef.current = true;
+    stopLive();
+    inform(message, "error");
+  }
+
   function startRecording(stream: MediaStream) {
-    if (typeof MediaRecorder==="undefined") {inform("Este navegador no permite grabar audio WebM.","info");return;}
-    const type = ["audio/webm;codecs=opus","audio/webm","audio/mp4"].find(x=>MediaRecorder.isTypeSupported(x));
+    if (recorderRef.current) return;
+    if (typeof MediaRecorder === "undefined") {
+      inform("Tu navegador no admite la grabación de audio. Prueba Chrome o Edge.", "info");
+      return;
+    }
+    const type = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find(t => MediaRecorder.isTypeSupported(t));
     try {
-      const rec=new MediaRecorder(stream,type?{mimeType:type}:undefined);
-      recorderRef.current=rec; chunksRef.current=[];
-      rec.ondataavailable=e=>{if(e.data.size)chunksRef.current.push(e.data);};
-      rec.onstop=()=>{
-        const blob=new Blob(chunksRef.current,{type:rec.mimeType || "audio/webm"});
-        if (!blob.size) return;
+      const recorder = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+      const pieces: BlobPart[] = [];
+      recorderRef.current = recorder;
+      recorder.ondataavailable = e => { if (e.data.size > 0) pieces.push(e.data); };
+      recorder.onstop = () => {
+        const blob = new Blob(pieces, { type: recorder.mimeType || "audio/webm" });
+        if (!blob.size) {
+          if (!failedSessionRef.current) inform("La sesión terminó sin audio generado. Habla con GPT-Live y espera una respuesta antes de detenerla.", "info");
+          return;
+        }
         setAudioUrl(URL.createObjectURL(blob));
-        setAudioName(`voice-studio-${new Date().toISOString().slice(0,19).replaceAll(":","-")}.${rec.mimeType.includes("mp4")?"m4a":"webm"}`);
-        inform("La prueba de voz está lista para escucharla y descargarla.","ok");
+        setAudioName('voice-studio-' + new Date().toISOString().slice(0, 19).replaceAll(":", "-") + (recorder.mimeType.includes("mp4") ? ".m4a" : ".webm"));
+        if (!failedSessionRef.current) inform("Grabación terminada. Puedes escucharla y descargarla.", "ok");
       };
-      rec.start(400);
-    } catch {inform("La conexión funciona, pero la grabación no está disponible en este navegador.","info");}
+      recorder.start(500);
+    } catch {
+      inform("La sesión está conectada, pero tu navegador no admite grabar este audio.", "info");
+    }
   }
+
   async function startLive() {
-    if (!selectedVoice) {inform("Primero crea o selecciona una voz guardada.","error");return;}
-    if (!navigator.mediaDevices?.getUserMedia) {inform("Necesitas HTTPS o localhost para usar el micrófono.","error");return;}
-    liveStateRef.current="connecting";setLiveState("connecting");setLiveTranscript("");setAudioUrl(null);setNotice(null);
-    let peer:RTCPeerConnection|null=null;
+    if (liveStateRef.current !== "idle") return;
+    if (!selectedVoice) { inform("Primero crea o selecciona una voz guardada.", "error"); return; }
+    if (!navigator.mediaDevices?.getUserMedia) { inform("Necesitas HTTPS o localhost para usar el micrófono.", "error"); return; }
+    failedSessionRef.current = false;
+    liveStateRef.current = "connecting";
+    setLiveState("connecting");
+    setConnectionStep("Solicitando permiso del micrófono...");
+    setLiveTranscript("");
+    setLiveSeconds(0);
+    setAudioUrl(null);
+    setNotice(null);
+    let peer: RTCPeerConnection | null = null;
     try {
-      const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true},video:false});
-      inputRef.current=stream;
-      peer=new RTCPeerConnection();pcRef.current=peer;
-      stream.getTracks().forEach(track=>peer!.addTrack(track,stream));
-      peer.ontrack=e=>{
-        if (e.track.kind!=="audio") return;
-        const remote=e.streams[0] || new MediaStream([e.track]);
-        if (audioRef.current) {audioRef.current.srcObject=remote;void audioRef.current.play().catch(()=>inform("Permite reproducir audio desde el navegador.","info"));}
-        if (!recorderRef.current) startRecording(remote);
-      };
-      peer.onconnectionstatechange=()=>{if(peer?.connectionState==="failed") {inform("Se perdió la conexión con GPT-Live.","error");stopLive();}};
-      const dc=peer.createDataChannel("oai-events");dcRef.current=dc;
-      dc.onmessage=e=>{
-        try {
-          const message=JSON.parse(e.data);
-          if(message.type==="session.started") {liveStateRef.current="live";setLiveState("live");}
-          if(message.type==="session.output_transcript.delta") setLiveTranscript(s=>(s+String(message.delta||"")).slice(-10000));
-          if(message.type==="session.usage.updated") setLiveSeconds(message.usage?.seconds||0);
-          if(message.type==="error") inform(message.error?.message||"OpenAI reportó un error en la sesión.","error");
-          if(message.type==="session.closed") stopLive();
-        }catch { /* ignoring unrecognized event payload */ }
-      };
-      const offer=await peer.createOffer();await peer.setLocalDescription(offer);
-      await new Promise<void>(resolve=>{
-        if (peer!.iceGatheringState==="complete") return resolve();
-        const done=()=>{if (peer) peer.removeEventListener("icegatheringstatechange",check);clearTimeout(timer);resolve();};
-        const check=()=>{if(peer?.iceGatheringState==="complete")done();};
-        const timer=setTimeout(done,9000);
-        peer!.addEventListener("icegatheringstatechange",check);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+        video: false
       });
-      const response=await fetch("/api/live",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sdp:peer.localDescription?.sdp,voiceId:selectedVoice.id,prompt:selectedVoice.prompt})});
-      const data=await response.json();if(!response.ok)throw new Error(data.error||"No se inició la conexión Live.");
-      await peer.setRemoteDescription({type:"answer",sdp:data.sdp});
-      inform("Sesión iniciada. Habla al micrófono para escuchar tu nueva voz.","ok");
-    }catch(e) {stopLive();inform(safeMessage(e),"error");}
+      // The user may have cancelled while the browser permission dialog was open.
+      if (liveStateRef.current === "idle") {
+        stream.getTracks().forEach(track => track.stop());
+        return;
+      }
+      inputRef.current = stream;
+      peer = new RTCPeerConnection();
+      const connection = peer;
+      pcRef.current = connection;
+      const isCurrent = () => pcRef.current === connection && liveStateRef.current !== "idle";
+      const streamForRecording = () => {
+        if (remoteStreamRef.current && liveStateRef.current === "live") startRecording(remoteStreamRef.current);
+      };
+
+      connection.ontrack = e => {
+        if (e.track.kind !== "audio" || !isCurrent()) return;
+        const remote = e.streams[0] || new MediaStream([e.track]);
+        remoteStreamRef.current = remote;
+        if (audioRef.current) {
+          audioRef.current.srcObject = remote;
+          void audioRef.current.play().catch(() => {
+            if (isCurrent()) inform("Tu navegador bloqueó la reproducción. Habilita el sonido para este sitio.", "info");
+          });
+        }
+        // Do not start a recorder during SDP negotiation: the track may not be active yet.
+        streamForRecording();
+      };
+      connection.onconnectionstatechange = () => {
+        if (!isCurrent()) return;
+        if (connection.connectionState === "failed") {
+          failLive("WebRTC no pudo establecer la conexión. Revisa tu red (VPN, firewall o WebRTC/UDP) e intenta de nuevo.");
+        }
+      };
+      stream.getAudioTracks().forEach(track => connection.addTrack(track, stream));
+      const channel = connection.createDataChannel("oai-events");
+      dcRef.current = channel;
+      channel.onclose = () => {
+        if (isCurrent()) failLive("El canal de GPT-Live se cerró inesperadamente. La grabación se detuvo por pérdida de conexión.");
+      };
+      channel.onerror = () => {
+        if (isCurrent()) failLive("Error en el canal de datos de GPT-Live. Comprueba tu conexión de red.");
+      };
+      channel.onmessage = e => {
+        if (!isCurrent()) return;
+        try {
+          const event = JSON.parse(e.data);
+          if (event.type === "session.started") {
+            if (startupTimerRef.current) clearTimeout(startupTimerRef.current);
+            startupTimerRef.current = null;
+            liveStateRef.current = "live";
+            setLiveState("live");
+            setConnectionStep("Micrófono activo");
+            streamForRecording();
+            inform("GPT-Live conectado. Habla y espera su respuesta; el audio se guardará al detener la sesión.", "ok");
+          } else if (event.type === "session.output_transcript.delta") {
+            setLiveTranscript(s => (s + String(event.delta || "")).slice(-10000));
+          } else if (event.type === "session.usage.updated") {
+            setLiveSeconds(event.usage?.seconds || 0);
+          } else if (event.type === "error") {
+            failLive(event.error?.message || "GPT-Live reportó un error en la sesión.");
+          } else if (event.type === "session.closed") {
+            const reason = typeof event.reason === "string" ? event.reason : "desconocida";
+            failedSessionRef.current = reason !== "close_requested";
+            stopLive();
+            inform(reason === "close_requested" ? "Sesión finalizada." : "GPT-Live cerró la sesión (motivo: " + reason + "). Intenta de nuevo.", reason === "close_requested" ? "info" : "error");
+          }
+        } catch (error) {
+          // Do not swallow actual session errors; only ignore malformed JSON events.
+          if (error instanceof SyntaxError) return;
+          if (isCurrent()) failLive("Error procesando la sesión Live.");
+        }
+      };
+
+      setConnectionStep("Negociando audio y red...");
+      const offer = await connection.createOffer();
+      await connection.setLocalDescription(offer);
+      // This API exchanges a complete SDP offer; an incomplete ICE gathering can
+      // cause an apparently successful start followed by an immediate disconnect.
+      if (connection.iceGatheringState !== "complete") {
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            connection.removeEventListener("icegatheringstatechange", onState);
+            reject(new Error("No se completó ICE. Revisa la conexión, firewall o VPN."));
+          }, 15000);
+          function onState() {
+            if (connection.iceGatheringState !== "complete") return;
+            clearTimeout(timeout);
+            connection.removeEventListener("icegatheringstatechange", onState);
+            resolve();
+          }
+          connection.addEventListener("icegatheringstatechange", onState);
+        });
+      }
+      if (!isCurrent()) return;
+      setConnectionStep("Creando sesión GPT-Live...");
+      startupTimerRef.current = setTimeout(() => {
+        if (isCurrent() && liveStateRef.current === "connecting") {
+          failLive("No llegó la confirmación de GPT-Live en 60 segundos. Revisa la conexión y vuelve a intentar.");
+        }
+      }, 60000);
+      const response = await fetch("/api/live", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sdp: connection.localDescription?.sdp, voiceId: selectedVoice.id, prompt: selectedVoice.prompt })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.error || "No se pudo iniciar GPT-Live (HTTP " + response.status + ").");
+      }
+      if (!isCurrent()) return;
+      if (typeof data.sdp !== "string") throw new Error("OpenAI no devolvió una respuesta WebRTC válida.");
+      setConnectionStep("Esperando confirmación de GPT-Live...");
+      await connection.setRemoteDescription({ type: "answer", sdp: data.sdp });
+      // "session.started" is the source of truth for the connected state.
+    } catch (error) {
+      if (liveStateRef.current !== "idle") {
+        const name = error instanceof DOMException ? error.name : "";
+        const description = name === "NotAllowedError" ? "El micrófono está bloqueado. Permítelo en los ajustes del navegador." :
+          name === "NotFoundError" ? "No se encontró un micrófono disponible." :
+          error instanceof Error ? error.message : "No se pudo establecer la sesión Live.";
+        failLive(description);
+      }
+    }
   }
+
   function sendScript() {
     if (dcRef.current?.readyState!=="open" || liveStateRef.current!=="live") {inform("Inicia primero una sesión Live.","error");return;}
     if(!script.trim()) {inform("Escribe un texto para enviar.","error");return;}
@@ -223,7 +358,7 @@ export default function Page() {
           <div className="lower-grid">
             <section className="playback-panel panel"><div className="section-title"><div className="panel-title"><span className="icon-square cyan"><Headphones size={19}/></span><div><h2>Laboratorio Live</h2><p>Escucha tu voz con GPT-Live en tiempo real</p></div></div><span className={`live-indicator ${liveState==="live"?"on":""}`}><span/>{liveState==="live"?"EN VIVO":liveState==="connecting"?"CONECTANDO":"EN ESPERA"}</span></div>
               <div className="playback-body"><div className="player-art"><div className="player-halo"><AudioWaveform size={24}/></div></div><div className="player-center"><strong>{selectedVoice?.name??"Tu próxima voz"}</strong><span>{selectedVoice?"Voz personalizada · GPT-Live 1":"Crea una voz para empezar a escucharla"}</span><MiniWave active={liveState==="live"}/></div><div className="player-buttons">{liveState==="idle"?<button type="button" className="play-button" disabled={!selectedVoice} onClick={startLive} aria-label="Iniciar sesión Live"><Play size={21} fill="currentColor"/></button>:<button type="button" className="play-button stop-button" onClick={stopLive} aria-label="Finalizar sesión Live"><Square size={18} fill="currentColor"/></button>}</div></div>
-              <div className="player-footer"><span><Mic2 size={15}/> {liveState==="live"?"Micrófono activo":liveState==="connecting"?"Solicitando conexión":"Vista previa conversacional"}</span><button type="button" disabled={liveState!=="live"} className="outline-button" onClick={sendScript}><FileText size={15}/> Enviar guion a Live</button></div>
+              <div className="player-footer"><span><Mic2 size={15}/> {liveState==="live"?"Micrófono activo":liveState==="connecting"?connectionStep:"Vista previa conversacional"}</span><button type="button" disabled={liveState!=="live"} className="outline-button" onClick={sendScript}><FileText size={15}/> Enviar guion a Live</button></div>
               {liveTranscript&&<div className="transcript"><span>LO QUE DIJO GPT-LIVE</span><p>{liveTranscript}</p></div>}
               {liveSeconds>0&&<div className="session-usage">Duración facturable reportada: {Math.round(liveSeconds)} s</div>}
               {audioUrl&&<div className="saved-audio"><div><FileAudio size={17}/><strong>Prueba de voz grabada</strong></div><audio controls src={audioUrl} preload="metadata"/><button type="button" className="outline-button" onClick={downloadAudio}><Download size={16}/> Descargar audio</button></div>}
