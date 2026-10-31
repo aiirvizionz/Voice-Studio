@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: voice-studio
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22.16.0"
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: STUDIO_USERNAME
+        sync: false
+      - key: STUDIO_PASSWORD
+        sync: false
